@@ -106,7 +106,7 @@ def fit(
             writer.add_scalar(
                 "Loss/Test", test_loss, (split_idx * args.epochs) + epoch_id
             )
-            # 更新学习率
+            # 
             lr_scheduler.step(test_loss)
             #
             if test_acc > best_test_acc:
