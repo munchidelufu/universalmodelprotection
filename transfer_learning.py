@@ -106,7 +106,7 @@ if __name__ == "__main__":
         device = torch.device("cuda", args.gpu)
     #
     dataset = bci_loader.load_mahnob_dataset(model_name=args.model_name)
-    # 不使用domain--adaption 99%,
+    # 
     kfold = KFoldGroupbyTrial(
         n_splits=5, split_path=f"./bci_data_tl/{args.model_name}/split"
     )
