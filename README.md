@@ -1,2 +1,2 @@
 # universalmodelprotection
-`univerfingerprint.py` consist our Meta-Fingerprint and Perturbed-Fingerprint.
+`universal_fingerprint.py` consist our Meta-Fingerprint and Perturbed-Fingerprint.
