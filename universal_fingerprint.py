@@ -1,18 +1,41 @@
 import os
 import csv
-import utils
+import sys
+
+sys.path.append("/data/xuth/deep_ipr")
+import argparse
+from functools import partial
+
 import torch
-import bci_loader
-import model_load
 import torchvision
 import numpy as np
 import torch.nn.functional as F
-from config import *
+from tqdm import tqdm
 from torch.nn import Module
-from functools import partial
 from typing import Union, List
 from torch.utils.data._utils import collate
 from torch.utils.data import Dataset, DataLoader, Subset
+
+from easydeepip.util import utils
+from easydeepip.util.model_loader import CVModelLoader
+from easydeepip.util.model_loader import BCIModelLoader
+from easydeepip.util.model_loader import NLPModelLoader
+from easydeepip.util.data_adapter import SplitDataConverter
+from easydeepip.model_ip.model_ip import ModelIP
+from easydeepip.quary_attack import QueryAttack
+
+COMPONENT = ["cc", "cw", "uc", "uw"]
+
+CV_MODEL_TO_NUM = {
+    "source": 1,
+    "model_extract_l": 15,
+    "model_extract_adv": 15,
+    "model_extract_p": 15,
+    "transfer_learning": 10,
+    "fine_prune": 10,
+    "fine_tune": 20,
+    "irrelevant": 15,
+}
 
 
 class FeatureHook:
@@ -50,7 +73,7 @@ class MetaFingerprint:
         Args:
             n (int): number of samples of the four types, where equal numbers are taken.
         """
-        dataloader = DataLoader(dataset=self.dataset, shuffle=False, batch_size=1000)
+        dataloader = DataLoader(dataset=self.dataset, shuffle=False, batch_size=64)
         correct_info, wrong_info = self.test_pro(
             model=self.model, dataloader=dataloader
         )
@@ -77,9 +100,10 @@ class MetaFingerprint:
         data = torch.stack(data, dim=0)
         label = torch.tensor(label)
 
-        utils.save_result(
-            path=f"./fingerprint/{self.field}/meta/original_{mode}.pkl",
-            data={"data": data, "label": label},
+        ModelIP.save_ip(
+            to_file=f"./fingerprint/{self.field}/meta_{n}/original_{mode}.pkl",
+            data=data,
+            label=label,
         )
 
     def test_pro(self, model: Module, dataloader: DataLoader):
@@ -150,8 +174,8 @@ class PerturbedFingerprint:
         self.finger_components = COMPONENT
         if field == "cv":
             self.model_to_num = CV_MODEL_TO_NUM
-        elif field == "bci":
-            self.model_to_num = BCI_MODEL_TO_NUM
+        else:
+            raise NotImplementedError
 
     def pfa(
         self,
@@ -173,32 +197,36 @@ class PerturbedFingerprint:
         for param in model.parameters():
             param.requires_grad = False
         input = torch.unsqueeze(input, dim=0)
-        input.requires_grad = True
-        optimizer = torch.optim.Adam([input], lr=self.lr)
-        p = F.softmax(model(input), dim=1)
+        input_clone = input.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([input_clone], lr=self.lr)
+        p = F.softmax(model(input_clone), dim=1)
         i = torch.argmax(p)
+        cur_p = p[0][i]
         if finger_component.startswith("c"):
             j = torch.argmin(p)
             for _ in range(self.iters):
-                p = F.softmax(model(input), dim=1)
+                p = F.softmax(model(input_clone), dim=1)
                 loss = -1 * (p[0][i] - p[0][j]) / (1 - p[0][i] + self.delta)
                 optimizer.zero_grad()
                 loss.backward(retain_graph=True)
                 optimizer.step()
         elif finger_component.startswith("u"):
+            dis = p[0][i] - 1 / len(p[0])
+            top = 2 * dis + cur_p
             j = torch.topk(p, k=2, dim=1)[1][:, 1]
             for _ in range(self.iters):
-                p = F.softmax(model(input), dim=1)
-                loss = -1 * (
-                    0.5 * (p[0][i] - p[0][j]) / (1 - (p[0][i] + p[0][j]) + self.delta)
-                    + 0.5 / torch.norm(p[0][i] - p[0][j], p=1)
-                )
+                p = F.softmax(model(input_clone), dim=1)
+                if p[0][i] >= top:
+                    break
+                clamped_p = torch.clamp(p[0][i], min=cur_p, max=top)
+                loss = -1 * torch.log(clamped_p)
                 optimizer.zero_grad()
-                loss.backward(retain_graph=True)
-                optimizer.step()
-        return input.detach()
+                grads = torch.autograd.grad(loss, input_clone, retain_graph=True)
+                input_clone.data = input_clone.data - self.lr * grads[0]
+        return input_clone.detach()
 
-    def pfa_helper(self, model: torch.nn.Module):
+    @utils.timer
+    def pfa_helper(self, model: torch.nn.Module, n: int):
         """
         Args:
             model (torch.nn.Module): The source model to be protected.
@@ -207,18 +235,20 @@ class PerturbedFingerprint:
             verbose (bool, optional): Whether to print new labels for generated samples.
         """
         for fc in self.finger_components:
-            meta_data_path = f"./fingerprint/{self.field}/meta/original_{fc}.pkl"
-            meta_data = utils.load_result(meta_data_path)["data"]
+            meta_data_path = f"./fingerprint/{self.field}/meta_{n}/original_{fc}.pkl"
+            meta_data = ModelIP.load_ip(meta_data_path)["data"]
             sample_record = []
             for i in range(len(meta_data)):
                 pert_s = self.pfa(model, meta_data[i], fc)
                 sample_record.append(pert_s)
             pert_datas = torch.cat(sample_record, dim=0)
             pert_labels = torch.argmax(model(pert_datas), dim=1)
-            utils.save_result(
-                f"./fingerprint/{self.field}/pert/original_{fc}.pkl",
-                {"data": pert_datas, "label": pert_labels},
+            ModelIP.save_ip(
+                to_file=f"./fingerprint/{self.field}/pert_{n}_{self.lr}_{self.iters}/original_{fc}.pkl",
+                data=pert_datas,
+                label=pert_labels,
             )
+        return None
 
 
 class FingerprintMatch:
@@ -228,18 +258,26 @@ class FingerprintMatch:
         meta: bool,
         device: torch.device,
         ip_erase: str,
+        n: int,
+        lr: float,
+        iters: int,
     ) -> None:
         self.field = field
         self.finger_component = COMPONENT
         self.meta = meta
+        self.n = n
+        self.lr = lr
+        self.iters = iters
         if field == "cv":
             self.model_num = CV_MODEL_TO_NUM
-        elif field == "bci":
-            self.model_num = BCI_MODEL_TO_NUM
+        else:
+            raise NotImplementedError
 
         self.device = device
         save_dir = (
-            f"./result/{self.field}/meta/" if meta else f"./result/{self.field}/pert/"
+            f"./result/{self.field}/meta_{self.n}/"
+            if meta
+            else f"./result/{self.field}/pert_{self.n}_{self.lr}_{self.iters}/"
         )
         os.makedirs(save_dir, exist_ok=True)
         self.feature_path = os.path.join(save_dir, f"{ip_erase}_feature.csv")
@@ -247,25 +285,29 @@ class FingerprintMatch:
 
     def dump_feature(self):
         ml = (
-            model_load.load_cv_model
+            CVModelLoader(dataset_name="cifar100", device=self.device)
             if self.field == "cv"
-            else model_load.load_bci_model
+            else BCIModelLoader(dataset_name="cifar100", device=self.device)
         )
         with open(self.feature_path, mode="a", newline="") as file:
             writer = csv.writer(file)
             for model_type, num in self.model_num.items():
                 for i in range(num):
+                    if model_type in ["irrelevant"]:
+                        i += 5
+
                     feature_record = []
-                    model = ml(i, model_type, self.device)
+                    # print(model_type, num)
+                    model = ml.load_model(mode=model_type, index=i)
                     model.to(self.device)
                     model.eval()
                     for fc in self.finger_component:
                         fc_path = (
-                            f"./fingerprint/{self.field}/meta/original_{fc}.pkl"
+                            f"./fingerprint/{self.field}/meta_{self.n}/{self.ip_erase}_{fc}.pkl"
                             if self.meta
-                            else f"./fingerprint/{self.field}/pert/original_{fc}.pkl"
+                            else f"./fingerprint/{self.field}/pert_{self.n}_{self.lr}_{self.iters}/{self.ip_erase}_{fc}.pkl"
                         )
-                        finger = utils.load_result(fc_path)
+                        finger = ModelIP.load_ip(fc_path)
                         data = finger["data"].to(self.device)
                         label = finger["label"].to(self.device)
                         pred = torch.argmax(model(data.to(self.device)), dim=1)
@@ -302,8 +344,8 @@ class FingerprintMatch:
         tl_feature = np.array(
             [row[:-1] for row in features if row[-1] == "transfer_learning"]
         )
-        fp_feature = np.array([row[:-1] for row in features if row[-1] == "fineprune"])
-        ft_feature = np.array([row[:-1] for row in features if row[-1] == "finetune"])
+        fp_feature = np.array([row[:-1] for row in features if row[-1] == "fine_prune"])
+        ft_feature = np.array([row[:-1] for row in features if row[-1] == "fine_tune"])
         adv_feature = np.array(
             [row[:-1] for row in features if row[-1] == "model_extract_adv"]
         )
@@ -313,94 +355,199 @@ class FingerprintMatch:
             simi_score = np.linalg.norm(input - source_feature[0], ord=2)
             return simi_score
 
-        irr_simi = list(map(helper, irr_feature))
-        pro_simi = list(map(helper, pro_feature))
-        lab_simi = list(map(helper, lab_feature))
-        tl_simi = list(map(helper, tl_feature))
-        fp_simi = list(map(helper, fp_feature))
-        ft_simi = list(map(helper, ft_feature))
-        adv_simi = list(map(helper, adv_feature))
-        pro_auc = utils.calculate_auc(list_a=pro_simi, list_b=irr_simi)
-        lab_auc = utils.calculate_auc(list_a=lab_simi, list_b=irr_simi)
-        tl_auc = utils.calculate_auc(list_a=tl_simi, list_b=irr_simi)
-        fp_auc = utils.calculate_auc(list_a=fp_simi, list_b=irr_simi)
-        ft_auc = utils.calculate_auc(list_a=ft_simi, list_b=irr_simi)
-        adv_auc = utils.calculate_auc(list_a=adv_simi, list_b=irr_simi)
-        if verbose:
-            print(
-                "ft:",
-                ft_auc,
-                "fp:",
-                fp_auc,
-                "lab:",
-                lab_auc,
-                "pro:",
-                pro_auc,
-                "adv:",
-                adv_auc,
-                "tl:",
-                tl_auc,
-            )
-        auc_records = [ft_auc, fp_auc, lab_auc, pro_auc, adv_auc, tl_auc]
-        return sum(auc_records) / len(auc_records)
+        try:
+            irr_simi = list(map(helper, irr_feature))
+            pro_simi = list(map(helper, pro_feature))
+            lab_simi = list(map(helper, lab_feature))
+            tl_simi = list(map(helper, tl_feature))
+            fp_simi = list(map(helper, fp_feature))
+            ft_simi = list(map(helper, ft_feature))
+            adv_simi = list(map(helper, adv_feature))
+
+            pro_auc = utils.calculate_auc(list_a=pro_simi, list_b=irr_simi)
+            lab_auc = utils.calculate_auc(list_a=lab_simi, list_b=irr_simi)
+            tl_auc = utils.calculate_auc(list_a=tl_simi, list_b=irr_simi)
+            fp_auc = utils.calculate_auc(list_a=fp_simi, list_b=irr_simi)
+            ft_auc = utils.calculate_auc(list_a=ft_simi, list_b=irr_simi)
+            adv_auc = utils.calculate_auc(list_a=adv_simi, list_b=irr_simi)
+            if verbose:
+                print(
+                    "ft:",
+                    ft_auc,
+                    "fp:",
+                    fp_auc,
+                    "lab:",
+                    lab_auc,
+                    "pro:",
+                    pro_auc,
+                    "adv:",
+                    adv_auc,
+                    "tl:",
+                    tl_auc,
+                )
+            auc_records = [ft_auc, fp_auc, lab_auc, pro_auc, adv_auc, tl_auc]
+            return sum(auc_records) / len(auc_records)
+        except ValueError:
+            print(self.n, self.lr, self.iters)
+
+
+class GridSearch:
+    """AI is creating summary for"""
+
+    def __init__(
+        self, n: list, iters: list, lr: list, source_model: Module, device: torch.device
+    ):
+        self.n = n
+        self.iters = iters
+        self.lr = lr
+        self.field = "cv"
+        self.type = "meta"
+        self.ip_erase = "original"
+        self.device = device
+
+        self.source_model = source_model
+
+    def search(self):
+        res = {}
+        for i in tqdm(self.n, desc="n Search"):
+            for lr in tqdm(self.lr, desc="lr Search", leave=False):
+                for it in tqdm(self.iters, desc="iter Search", leave=False):
+                    if (
+                        os.path.exists(f"./fingerprint/{self.field}/pert_{i}_{lr}_{it}")
+                        and len(
+                            os.listdir(f"./fingerprint/{self.field}/pert_{i}_{lr}_{it}")
+                        )
+                        == 4
+                    ):
+                        pass
+                    else:
+                        pf = PerturbedFingerprint(field=self.field, iters=it, lr=lr)
+                        pf.pfa_helper(model=self.source_model, n=i)
+                    pert_fm = FingerprintMatch(
+                        field=self.field,
+                        meta=False,
+                        device=self.device,
+                        ip_erase=self.ip_erase,
+                        n=i,
+                        lr=lr,
+                        iters=it,
+                    )
+                    pert_file = f"./result/{self.field}/pert_{i}_{lr}_{it}/{self.ip_erase}_feature.csv"
+                    if os.path.exists(pert_file):
+                        os.remove(pert_file)
+                    pert_fm.dump_feature()
+                    meta_fm = FingerprintMatch(
+                        field=self.field,
+                        meta=True,
+                        device=self.device,
+                        ip_erase=self.ip_erase,
+                        n=i,
+                        lr=lr,
+                        iters=it,
+                    )
+                    meta_file = (
+                        f"./result/{self.field}/meta_{i}/{self.ip_erase}_feature.csv"
+                    )
+                    if os.path.exists(meta_file):
+                        os.remove(meta_file)
+                    meta_fm.dump_feature()
+
+                    try:
+                        meta_avg = meta_fm.fingerprint_recognition(verbose=False)
+                        pert_avg = pert_fm.fingerprint_recognition(verbose=False)
+                        res[f"n_{i}_lr_{lr}_iter_{it}"] = (meta_avg + pert_avg) / 2
+                    except FileNotFoundError:
+                        print(i, lr, it)
+        result = dict(sorted(res.items(), key=lambda x: x[1], reverse=True))
+        print(result)
+        # with open("./grid_search.txt", "w") as file:
+        #     file.write(str(result))
+        print("meta_pert and search done!")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu", type=int, default=5)
+    parser.add_argument("--dataset", type=str, default="cifar100")
+    args = parser.parse_args()
+
     utils.seed_everything(2023)
-    device = torch.device("cuda", 7)
+    device = torch.device("cuda", args.gpu)
     # field = "cv"
+    cv_model_loader = CVModelLoader(dataset_name="cifar100", device=device)
+    source_model = cv_model_loader.load_model(mode="source")
+    train_dataset, dev_dataset, test_dataset = SplitDataConverter.split(args.dataset)
 
-    # model = model_load.load_cv_model(0, "source", device)
-    # transform_test = torchvision.transforms.Compose(
-    #     [
-    #         torchvision.transforms.ToTensor(),
-    #         torchvision.transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-    #     ]
+    # mf = MetaFingerprint(
+    #     field="cv", model=source_model, dataset=train_dataset, device=device
     # )
-    # dataset = torchvision.datasets.CIFAR10(
-    #     root="./cv_data", train=True, download=False, transform=transform_test
-    # )
-    # mf = MetaFingerprint(field, model, dataset, device)
-    # mf.generate_meta_fingerprint_point(n=80)
+    # mf.generate_meta_fingerprint_point(20) # gen time 16.97s
+    # for n in range(10, 101, 10):
+    #     mf.generate_meta_fingerprint_point(n=n)  # 15.99s
 
     # pf = PerturbedFingerprint(
-    #     field,
-    #     iters=10,
-    #     lr=0.001,
+    #     field="cv",
+    #     iters=20,
+    #     lr=0.01,
     # )
-    # pf.pfa_helper(model)
+    # pf.pfa_helper(source_model, 20)  # gen time 48.78s
 
-    # fm = FingerprintMatch(
-    #     field,
-    #     meta=True,
+    # device = torch.device("cuda", 1)
+    # gd = GridSearch(
+    #     n=list(range(10, 101, 10)),
+    #     iters=list(range(10, 51, 10)),
+    #     lr=[0.1, 0.01, 0.001],
+    #     source_model=source_model,
     #     device=device,
-    #     ip_erase="original",
     # )
+    # gd.search()
 
-    # fm.dump_feature()
-    # fm.fingerprint_recognition(verbose=True)
+    # ft: 1.0 fp: 0.89 lab: 1.0 pro: 1.0 adv: 1.0 tl: 0.62 original
+    # ft: 1.0 fp: 0.81 lab: 1.0 pro: 1.0 adv: 1.0 tl: 0.42 erasure
+    # @utils.timer
+    # def time_count():
+    #     fm = FingerprintMatch(
+    #         "cv",
+    #         meta=False,
+    #         device=device,
+    #         ip_erase="original",
+    #         n=20,
+    #         lr=0.01,
+    #         iters=20,
+    #     )
+    #     fm.dump_feature()
+    #     fm.fingerprint_recognition(verbose=True)
 
-    #################################
-    # field = "bci"
-    # model = model_load.load_bci_model(0, "source", device)
-    # dataset, _ = bci_loader.load_split_dataset(model_name="conformer")
+    # time_count()  # infer time 125.09s
 
-    # mf = MetaFingerprint(field, model, dataset, device)
-    # mf.generate_meta_fingerprint_point(n=30)
-
+    # ft: 1.0 fp: 0.81 lab: 1.0 pro: 1.0 adv: 1.0 tl: 0.5 original #125.02
+    # ft: 1.0 fp: 0.81 lab: 1.0 pro: 1.0 adv: 1.0 tl: 0.42 erasure
+    # mf = MetaFingerprint(
+    #     field="cv", model=source_model, dataset=train_dataset, device=device
+    # )
+    # mf.generate_meta_fingerprint_point(n=10)  # 15.99s
     # pf = PerturbedFingerprint(
-    #     field,
+    #     field="cv",
     #     iters=50,
-    #     lr=0.001,
+    #     lr=0.01,
     # )
-    # pf.pfa_helper(model)
+    # pf.pfa_helper(source_model, 10)  # 62.87s
 
-    # fm = FingerprintMatch(
-    #     field,
-    #     meta=False,
-    #     device=device,
-    #     ip_erase="original",
-    # )
+    # ft: 1.0 fp: 0.87 lab: 1.0 pro: 1.0 adv: 1.0 tl: 0.5 original
+    # ft: 1.0 fp: 0.82 lab: 1.0 pro: 1.0 adv: 0.97 tl: 0.47 erasure
+    # @utils.timer
+    # def time_count():
+    #     fm = FingerprintMatch(
+    #         "cv", meta=True, device=device, ip_erase="original", n=20, lr=0.01, iters=20
+    #     )
+    #     fm.dump_feature()
+    #     fm.fingerprint_recognition(verbose=True)
 
-    # fm.dump_feature()
-    # fm.fingerprint_recognition(verbose=True)
+    # time_count() # infer time 126.27s
+
+    # @utils.timer
+    # def helper():
+    #     fm.dump_feature()
+    #     fm.fingerprint_recognition(verbose=True)
+
+    # helper()
