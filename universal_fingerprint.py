@@ -2,7 +2,6 @@ import os
 import csv
 import sys
 
-sys.path.append("/data/xuth/deep_ipr")
 import argparse
 from functools import partial
 
